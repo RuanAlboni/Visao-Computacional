@@ -1,0 +1,18 @@
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Cache do Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Configurações locais
+.env
+.streamlit/secrets.toml
+.vscode/
+.idea/
+
+# Credenciais
+kaggle.json
