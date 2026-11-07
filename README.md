@@ -66,19 +66,6 @@ python -m streamlit run app_alimentos.py
 
 Selecione `cpu` na interface se nao tiver CUDA; uma GPU NVIDIA compativel pode selecionar `cuda`. A instalacao da versao CPU funciona para inferencia com os mesmos pesos `.pth`, sem novo treinamento. O computador precisa ter memoria RAM suficiente para carregar modelos e imagens.
 
-### Pesos e Git LFS
-
-Esta distribuicao inclui `models/yolo11n.pt`, `models/alimentos_multiclasse.pth` e `models/limiares_classico.json`, mas ao publicar no GitHub **use Git LFS** para os arquivos `.pt` e `.pth`. Para clonar o repositorio versionado via LFS:
-
-```powershell
-git lfs install
-git clone -b NOME_DA_BRANCH https://github.com/RuanAlboni/Visao-Computacional.git
-cd Visao-Computacional
-git lfs pull
-```
-
-Se obtiver o codigo sem os pesos, execute `python scripts/baixar_detector_alimentos.py` para baixar o detector oficial (requer internet) e obtenha o checkpoint treinado `alimentos_multiclasse.pth` separadamente. O detector oficial nao substitui a ResNet.
-
 ## Utilizacao
 
 1. Execute `python -m streamlit run app_alimentos.py`.
