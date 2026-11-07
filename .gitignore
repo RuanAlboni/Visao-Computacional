@@ -8,6 +8,12 @@ venv/
 env/
 ENV/
 
+.pytest_cache/
+*.pyc
+.env
+.env.*
+!.env.example
+
 # Dados (não versionar datasets grandes)
 data/raw/*
 data/processed/*
@@ -17,6 +23,11 @@ data/processed/*
 # Modelos treinados (não versionar, são grandes)
 models/*
 !models/.gitkeep
+models/*.pt
+models/*.pth
+logs/
+output/
+backups/
 
 # Jupyter
 .ipynb_checkpoints

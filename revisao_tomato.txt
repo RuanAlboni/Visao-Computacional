@@ -1,0 +1,1228 @@
+
+================================================================================
+ARQUIVO: src/modules/tomato/deteccao.py
+================================================================================
+"""Deteccao: YOLO (se houver pesos) -> segmentacao classica -> frame inteiro."""
+
+import numpy as np
+
+from src.modules.tomato.config import AREA_MIN_REGIAO, CONF_MIN_DETECCAO, MAX_REGIOES
+
+
+def caixa_frame_inteiro(imagem_rgb):
+    altura, largura = imagem_rgb.shape[:2]
+    return [(0, 0, largura, altura)]
+
+
+def _extrair_mascara(saida):
+    """Aceita mascara, (mascara, mensagem), dict ou lista e devolve o array 2D."""
+    if saida is None:
+        return None
+    if isinstance(saida, dict):
+        candidatos = list(saida.values())
+    elif isinstance(saida, (tuple, list)):
+        candidatos = list(saida)
+    else:
+        candidatos = [saida]
+    for item in candidatos:
+        if getattr(item, "ndim", None) == 2:
+            return item
+    return None
+
+
+def regioes_classicas(imagem_rgb, min_area=AREA_MIN_REGIAO, max_regioes=MAX_REGIOES):
+    """Caixas (x1, y1, x2, y2) a partir da mascara de segmentar_fruta.
+
+    segmentar_fruta devolve (mascara, mensagem) e levanta ValueError quando nao
+    consegue isolar a fruta; nesse caso devolvemos [] e o chamador cai no frame inteiro.
+    """
+    from src.classic.features import segmentar_fruta
+
+    try:
+        saida = segmentar_fruta(imagem_rgb)
+    except Exception:
+        return []
+
+    mascara = _extrair_mascara(saida)
+    if mascara is None:
+        return []
+    mascara = (np.asarray(mascara) > 0).astype("uint8") * 255
+    if not mascara.any():
+        return []
+
+    try:
+        import cv2
+    except ImportError:
+        return _caixas_via_numpy(mascara, min_area)
+
+    kernel = np.ones((5, 5), np.uint8)
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel, iterations=1)
+    contornos, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    caixas = []
+    for contorno in contornos:
+        x, y, largura, altura = cv2.boundingRect(contorno)
+        if largura * altura < min_area:
+            continue
+        caixas.append((x, y, x + largura, y + altura))
+    caixas.sort(key=lambda c: (c[2] - c[0]) * (c[3] - c[1]), reverse=True)
+    return caixas[:max_regioes]
+
+
+def regioes_yolo(modelo, imagem_rgb, conf=CONF_MIN_DETECCAO):
+    resultados = modelo.predict(source=imagem_rgb, conf=conf, verbose=False)
+    caixas = []
+    for resultado in resultados:
+        for caixa in getattr(resultado, "boxes", []):
+            x1, y1, x2, y2 = [int(v) for v in caixa.xyxy[0].tolist()]
+            caixas.append((x1, y1, x2, y2))
+    return caixas
+
+
+def detectar_regioes(imagem_rgb, modelo_yolo=None, min_area=AREA_MIN_REGIAO):
+    if modelo_yolo is not None:
+        caixas = regioes_yolo(modelo_yolo, imagem_rgb)
+        if caixas:
+            return caixas, "yolo"
+    caixas = regioes_classicas(imagem_rgb, min_area=min_area)
+    if caixas:
+        return caixas, "classica"
+    return caixa_frame_inteiro(imagem_rgb), "frame_inteiro"
+
+
+def _caixas_via_numpy(mascara, min_area):
+    ys, xs = np.nonzero(mascara)
+    if xs.size == 0:
+        return []
+    caixa = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+    return [caixa] if (caixa[2] - caixa[0]) * (caixa[3] - caixa[1]) >= min_area else []
+
+
+================================================================================
+ARQUIVO: src/classic/features.py
+================================================================================
+"""Extração de features clássicas (HSV, LBP, GLCM, manchas).
+Adaptado de FruitVision/src/classico.py — apenas funções de extração,
+sem lógica de decisão."""
+import cv2
+import numpy as np
+from skimage.feature import local_binary_pattern, graycomatrix, graycoprops
+
+def abrir_rgb(caminho):
+    from PIL import Image, ImageOps
+    with Image.open(caminho) as img:
+        return np.asarray(ImageOps.exif_transpose(img).convert("RGB"))
+
+def reduzir(rgb, limite=384):
+    altura, largura = rgb.shape[:2]
+    fator = min(1.0, limite / max(altura, largura))
+    if fator >= 1:
+        return rgb.copy()
+    return cv2.resize(rgb, (max(1, int(largura * fator)), max(1, int(altura * fator))), interpolation=cv2.INTER_AREA)
+
+def segmentar_fruta(rgb):
+    """Segmentação por diferença do fundo; GrabCut como reserva."""
+    h, w = rgb.shape[:2]
+    if min(h, w) < 35:
+        raise ValueError("Imagem muito pequena.")
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    b = max(3, min(h, w) // 12)
+    cantos = np.concatenate([
+        lab[:b, :b].reshape(-1, 3), lab[:b, -b:].reshape(-1, 3),
+        lab[-b:, :b].reshape(-1, 3), lab[-b:, -b:].reshape(-1, 3)
+    ], axis=0)
+    cor_fundo = np.median(cantos.astype(np.float32), axis=0)
+    distancia = np.linalg.norm(lab.astype(np.float32) - cor_fundo, axis=2)
+    saturacao = hsv[:, :, 1]
+    brilho = hsv[:, :, 2]
+    candidato = ((distancia > 29) | ((saturacao > 65) & (brilho > 38) & (distancia > 15))).astype(np.uint8) * 255
+    tamanho = max(3, int(min(h, w) * 0.017) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (tamanho, tamanho))
+    candidato = cv2.morphologyEx(candidato, cv2.MORPH_OPEN, kernel)
+    candidato = cv2.morphologyEx(candidato, cv2.MORPH_CLOSE, kernel, iterations=2)
+    principal = _componente_principal(candidato)
+    fracao = np.count_nonzero(principal) / (h * w)
+    if 0.035 <= fracao <= 0.88:
+        return principal > 0, "Segmentação por diferença de fundo."
+    raise ValueError("Não foi possível isolar a fruta.")
+
+def _componente_principal(mascara):
+    mascara = np.asarray(mascara, dtype=np.uint8)
+    n, rotulos, estatisticas, _ = cv2.connectedComponentsWithStats(mascara, 8)
+    if n <= 1:
+        return np.zeros(mascara.shape, dtype=np.uint8)
+    indice = 1 + np.argmax(estatisticas[1:, cv2.CC_STAT_AREA])
+    saida = (rotulos == indice).astype(np.uint8) * 255
+    contornos, _ = cv2.findContours(saida, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contornos:
+        cv2.drawContours(saida, contornos, -1, 255, cv2.FILLED)
+    return saida
+
+def extrair_features(rgb, mascara_fruta):
+    """Extrai features: manchas, textura, LBP, GLCM."""
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    h, s, v = (hsv[:, :, i].astype(np.int16) for i in range(3))
+    l = lab[:, :, 0].astype(np.int16)
+    ref_claro = np.percentile(l[mascara], 78)
+    escuro_relativo = (ref_claro - l) > 24
+    preto = v < 82
+    marrom = (h >= 7) & (h <= 27) & (s > 50) & (v < 177)
+    cinza_mofo = (s < 66) & (v < 153) & escuro_relativo
+    return {"preto": preto, "marrom": marrom, "cinza_mofo": cinza_mofo,
+            "escuro_relativo": escuro_relativo, "gray": gray, "v": v}
+
+
+================================================================================
+ARQUIVO: src/classic/tomato_rules.py
+================================================================================
+"""Pipeline classico especifico do tomate.
+
+O analisar_classico original so conhece maca, banana e laranja ("Especie nao
+suportada: tomate"). Este modulo cobre o tomate com regras de cor em HSV e
+devolve o mesmo contrato usado na fusao: classe, probabilidade e confianca.
+
+Ideia: tomate bom tem vermelho vivo e saturado; tomate passado ganha manchas
+escuras/marrons, perda de saturacao e amarelamento.
+"""
+
+import numpy as np
+
+# Faixas HSV (H em 0..180, como no OpenCV)
+H_VERMELHO = ((0, 14), (160, 180))
+H_AMARELO = (15, 45)
+
+
+def _rgb_para_hsv(rgb):
+    """RGB uint8 -> (H 0..180, S 0..255, V 0..255) sem depender do OpenCV."""
+    arr = rgb.astype(np.float32) / 255.0
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    maximo = arr.max(axis=-1)
+    minimo = arr.min(axis=-1)
+    delta = maximo - minimo
+
+    h = np.zeros_like(maximo)
+    mask = delta > 1e-6
+    idx = mask & (maximo == r)
+    h[idx] = ((g[idx] - b[idx]) / delta[idx]) % 6
+    idx = mask & (maximo == g)
+    h[idx] = ((b[idx] - r[idx]) / delta[idx]) + 2
+    idx = mask & (maximo == b)
+    h[idx] = ((r[idx] - g[idx]) / delta[idx]) + 4
+
+    h = h * 30.0
+    s = np.where(maximo > 1e-6, delta / np.maximum(maximo, 1e-6), 0.0) * 255.0
+    v = maximo * 255.0
+    return h, s, v
+
+
+def _mascaras(h, s, v):
+    vermelho = np.zeros(h.shape, dtype=bool)
+    for inicio, fim in H_VERMELHO:
+        vermelho |= (h >= inicio) & (h <= fim)
+
+    saudavel = vermelho & (s > 110) & (v > 95)
+    mancha_escura = v < 85
+    amarelado = (h >= H_AMARELO[0]) & (h <= H_AMARELO[1]) & (s > 70) & (v > 60)
+    apagado = (s < 50) & (v > 40)
+    lesao = mancha_escura | amarelado | apagado
+    return saudavel, lesao
+
+
+def analisar_tomate(rgb, limiar=None):
+    """Classifica um tomate pelo pipeline classico.
+
+    Devolve dict compativel com interpretar_saida_classificador.
+    """
+    if rgb is None or getattr(rgb, "size", 0) == 0:
+        raise ValueError("Imagem vazia.")
+
+    h, s, v = _rgb_para_hsv(np.asarray(rgb)[..., :3])
+    saudavel, lesao = _mascaras(h, s, v)
+
+    pixels_saudavel = int(np.count_nonzero(saudavel))
+    pixels_lesao = int(np.count_nonzero(lesao))
+    total = pixels_saudavel + pixels_lesao
+    if total < 50:
+        raise ValueError("Regiao sem cor de tomate suficiente.")
+
+    razao = pixels_saudavel / total
+
+    # razao 0.50 -> divisa; 0.90 -> claramente fresco
+    probabilidade = float(np.clip((razao - 0.50) / 0.40, 0.0, 1.0))
+
+    # confianca cresce com a area analisada, saturando em 0.95
+    confianca = float(min(0.95, 0.30 + 0.65 * min(1.0, total / 5000.0)))
+
+    limite = limiar if limiar is not None else 0.50
+    classe = "tomate_fresco" if probabilidade >= limite else "tomate_deteriorado"
+    return {
+        "classe": classe,
+        "probabilidade": probabilidade,
+        "confianca": confianca,
+        "metricas": {
+            "razao_saudavel": round(razao, 3),
+            "pixels_saudavel": pixels_saudavel,
+            "pixels_lesao": pixels_lesao,
+        },
+    }
+
+
+================================================================================
+ARQUIVO: src/modules/tomato/modulo.py
+================================================================================
+"""Modulo tomate: detecta, classifica, funde as abordagens e emite veredito."""
+
+import dataclasses
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+
+from src.modules.base import BaseFruitModule
+from src.modules.tomato import vida_util
+from src.modules.tomato.config import (
+    ARMAZENAMENTO_PADRAO,
+    CLASSES,
+    CLASSE_FRESCO,
+    CONF_MIN_DETECCAO,
+    ESPECIE,
+    LIMIAR_APROPRIADO,
+    PESO_CLASSICO,
+    PESO_PROFUNDO,
+)
+from src.modules.tomato.deteccao import detectar_regioes
+
+EXTENSOES_IMAGEM = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+# nome usado no schema FruitDetection.fruit_type
+FRUIT_TYPE = "tomato"
+
+
+@dataclass
+class ResultadoTomate:
+    classe: str
+    estado: str
+    veredito: str
+    apropriado: bool
+    confianca: float
+    prob_fresco: float
+    dias_restantes: int
+    mensagem: str
+    recomendacao: str
+    bbox: tuple | None = None
+    fonte: str = "fusao"
+    incerto: bool = False
+    detalhes: dict = field(default_factory=dict)
+
+    def para_dict(self) -> dict:
+        dados = dict(self.__dict__)
+        dados["bbox"] = list(self.bbox) if self.bbox else None
+        return dados
+
+    def __str__(self) -> str:
+        marca = "OK " if self.apropriado else "NAO"
+        return (
+            f"[{marca}] {self.classe:<20} conf={self.confianca:.2f} "
+            f"p_fresco={self.prob_fresco:.2f} dias={self.dias_restantes} | {self.mensagem}"
+        )
+
+
+SINONIMOS_ESTADO = {
+    "deteriorado": ("deteriorad", "rotten", "podre", "estragad", "inapropriad", "ruim", "bad"),
+    "fresco": ("fresc", "fresh", "saudavel", "apropriad", "boa", "bom", "ok"),
+}
+
+
+def _estado_da_classe(classe):
+    nome = str(classe).strip().lower()
+    for estado, palavras in SINONIMOS_ESTADO.items():
+        if any(palavra in nome for palavra in palavras):
+            return estado
+    return None
+
+
+def _de_classe(classe, confianca=0.5):
+    # converte (classe textual, confianca) em (prob_fresco, confianca)
+    confianca = float(confianca) if isinstance(confianca, (int, float)) else 0.5
+    confianca = min(max(confianca, 0.0), 1.0)
+    estado = _estado_da_classe(classe)
+    if estado == "deteriorado":
+        return 1.0 - confianca, confianca
+    if estado == "fresco":
+        return confianca, confianca
+    return (1.0 if str(classe).strip().lower() == CLASSE_FRESCO else 0.0), confianca
+
+
+def _para_dicionario(saida):
+    # aceita dict, dataclass (ResultadoClassico) ou objeto simples
+    if isinstance(saida, dict):
+        return saida
+    if dataclasses.is_dataclass(saida) and not isinstance(saida, type):
+        return dataclasses.asdict(saida)
+    if hasattr(saida, "__dict__"):
+        return {chave: valor for chave, valor in vars(saida).items() if not chave.startswith("_")}
+    return None
+
+
+def _de_array(valor):
+    arr = np.asarray(valor, dtype=float).ravel()
+    if arr.size == 1:
+        prob = float(arr[0])
+        return prob, max(prob, 1.0 - prob)
+    # ordem assumida: CLASSES[0] = fresco, CLASSES[1] = deteriorado
+    return float(arr[0]), float(arr.max())
+
+
+def interpretar_saida_classificador(saida) -> tuple:
+    """Normaliza a saida de prever_rgb / analisar_classico em (prob_fresco, confianca)."""
+    dados = _para_dicionario(saida)
+    if dados is not None:
+        saida = dados
+        for chave in ("probabilidades", "probs", "probabilidade", "prob_fresco", "scores"):
+            if chave in saida:
+                return _de_array(saida[chave])
+        if any(classe in saida for classe in CLASSES):
+            return _de_array([float(saida.get(classe, 0.0)) for classe in CLASSES])
+        for chave in ("classe", "rotulo", "label", "classe_prevista", "estado"):
+            if chave in saida:
+                confianca = saida.get("confianca", saida.get("prob", saida.get("probabilidade", 0.5)))
+                if not isinstance(confianca, (int, float)):
+                    confianca = 0.5
+                return _de_classe(saida[chave], float(confianca))
+        raise ValueError("Dict sem 'classe' nem probabilidades.")
+    if isinstance(saida, (tuple, list)) and saida:
+        if isinstance(saida[0], str):
+            confianca = saida[1] if len(saida) > 1 and np.isscalar(saida[1]) else 0.5
+            return _de_classe(saida[0], float(confianca))
+        return _de_array(saida[-1] if len(saida) > 1 else saida[0])
+    return _de_array(saida)
+
+
+def _recortar(imagem_rgb, bbox):
+    altura, largura = imagem_rgb.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(largura, x2), min(altura, y2)
+    return imagem_rgb[y1:y2, x1:x2]
+
+
+def carregar_imagem(caminho):
+    """Abre a imagem em RGB (helper do classico, com fallback PIL)."""
+    try:
+        from src.classic._classico_original import abrir_rgb
+
+        imagem = abrir_rgb(str(caminho))
+        if imagem is not None:
+            return imagem
+    except Exception:
+        pass
+    try:
+        from PIL import Image
+
+        return np.asarray(Image.open(caminho).convert("RGB"))
+    except Exception:
+        return None
+
+
+def _condicao(apropriado: bool):
+    # resolve o enum FruitCondition sem depender dos nomes exatos dos membros
+    try:
+        from src.schemas.fruit import FruitCondition
+    except Exception:
+        return "fresh" if apropriado else "rotten"
+
+    membros = {membro.name.upper(): membro for membro in FruitCondition}
+    nomes = ("FRESH", "GOOD", "OK", "HEALTHY") if apropriado else ("ROTTEN", "BAD", "SPOILED", "DETERIORATED")
+    for nome in nomes:
+        if nome in membros:
+            return membros[nome]
+
+    valores = {str(membro.value).lower(): membro for membro in FruitCondition}
+    for nome in nomes:
+        if nome.lower() in valores:
+            return valores[nome.lower()]
+
+    # fallback: ignora UNKNOWN para nao mascarar o veredito
+    lista = [membro for membro in FruitCondition if membro.name.upper() != "UNKNOWN"]
+    if not lista:
+        lista = list(FruitCondition)
+    return lista[0] if apropriado else lista[-1]
+
+
+class TomatoModule(BaseFruitModule):
+    """Deteccao -> classificacao -> fusao -> veredito de consumo e dias restantes."""
+
+    fruit_type = ESPECIE
+    ESPECIE = ESPECIE
+    CLASSES = CLASSES
+
+    def __init__(
+        self,
+        modelo_path=None,
+        dispositivo=None,
+        detector_yolo=None,
+        armazenamento: str = ARMAZENAMENTO_PADRAO,
+        limiar: float = LIMIAR_APROPRIADO,
+        peso_profundo: float = PESO_PROFUNDO,
+        peso_classico: float = PESO_CLASSICO,
+        usar_profundo: bool = True,
+        usar_classico: bool = True,
+        especie_classico: str = ESPECIE,
+        limiar_classico: float | None = None,
+        min_conf_deteccao: float = CONF_MIN_DETECCAO,
+    ):
+        self.armazenamento = armazenamento
+        self.limiar = limiar
+        self.peso_profundo = peso_profundo
+        self.peso_classico = peso_classico
+        self.usar_profundo = usar_profundo
+        self.usar_classico = usar_classico
+        self.especie_classico = especie_classico
+        self.limiar_classico = limiar_classico
+        self.detector_yolo = detector_yolo
+        self.min_conf_deteccao = min_conf_deteccao
+        self.modelo = None
+        self.dispositivo = dispositivo
+        self._erro_profundo = None
+        self.modelo_path = str(modelo_path) if modelo_path else None
+        self._erro_classico = None
+        if usar_profundo and self.modelo_path and Path(self.modelo_path).exists():
+            self.load_model()
+
+    # --------------------------------------------------- contrato BaseFruitModule
+    def load_model(self) -> None:
+        """Carrega os pesos da ResNet do tomate a partir de self.modelo_path."""
+        if not self.modelo_path or not Path(self.modelo_path).exists():
+            raise FileNotFoundError(f"Pesos nao encontrados: {self.modelo_path}")
+        from src.models.resnet_classifier import carregar_modelo
+
+        self.modelo = carregar_modelo(str(self.modelo_path))
+        return None
+
+    def detect(self, image_path) -> list:
+        """Aceita caminho de imagem ou array RGB -> lista de FruitResult."""
+        imagem = carregar_imagem(image_path) if isinstance(image_path, (str, Path)) else image_path
+        if imagem is None:
+            raise FileNotFoundError(f"Imagem nao encontrada: {image_path}")
+        caminho = str(image_path) if isinstance(image_path, (str, Path)) else ""
+        return [self.para_fruit_result(r, caminho) for r in self.analisar(imagem)]
+
+    def detect_batch(self, image_paths: list) -> list:
+        """Analisa varias imagens (caminhos ou arrays) -> lista achatada de FruitResult."""
+        resultados = []
+        for entrada in image_paths:
+            try:
+                resultados.extend(self.detect(entrada))
+            except FileNotFoundError:
+                continue
+        return resultados
+
+    # ----------------------------------------------------------------- estagios
+    def _prob_profundo(self, recorte):
+        if self.modelo is None:
+            return None
+        from src.models.resnet_classifier import prever_rgb
+
+        tentativas = [
+            lambda: prever_rgb(recorte, self.modelo, self.dispositivo),
+            lambda: prever_rgb(recorte, self.modelo),
+            lambda: prever_rgb(self.modelo, recorte),
+        ]
+        erros = []
+        for tentativa in tentativas:
+            try:
+                return interpretar_saida_classificador(tentativa())
+            except TypeError as erro:
+                erros.append(repr(erro))
+            except Exception as erro:
+                self._erro_profundo = repr(erro)
+                return None
+        self._erro_profundo = " | ".join(erros)
+        return None
+
+    def _prob_classico(self, recorte):
+        if not self.usar_classico:
+            return None
+        erros = []
+
+        # Pipeline classico proprio do tomate (o analisar_classico original
+        # cobre apenas maca, banana e laranja).
+        try:
+            from src.classic.tomato_rules import analisar_tomate
+
+            return interpretar_saida_classificador(analisar_tomate(recorte, self.limiar_classico))
+        except Exception as erro:
+            erros.append(f"tomato_rules: {erro!r}")
+
+        # Reserva: caso o pipeline original passe a suportar a especie.
+        try:
+            from src.classic._classico_original import analisar_classico
+
+            if self.limiar_classico is not None:
+                return interpretar_saida_classificador(
+                    analisar_classico(recorte, self.especie_classico, self.limiar_classico)
+                )
+            return interpretar_saida_classificador(analisar_classico(recorte, self.especie_classico))
+        except Exception as erro:
+            erros.append(f"analisar_classico: {erro!r}")
+
+        self._erro_classico = " | ".join(erros)
+        return None
+
+    def fundir(self, recorte) -> tuple:
+        """Combina as abordagens disponiveis -> (prob_fresco, confianca, fonte)."""
+        fontes = []
+        profundo = self._prob_profundo(recorte)
+        if profundo is not None:
+            fontes.append((self.peso_profundo, profundo[0], profundo[1], "profundo"))
+        classico = self._prob_classico(recorte)
+        if classico is not None:
+            fontes.append((self.peso_classico, classico[0], classico[1], "classico"))
+        if not fontes:
+            detalhe = f" | erro classico: {self._erro_classico}" if self._erro_classico else ""
+            raise RuntimeError(
+                "Nenhuma abordagem disponivel: informe modelo_path (ResNet) "
+                f"ou habilite usar_classico=True.{detalhe}"
+            )
+        total = sum(f[0] for f in fontes)
+        prob = sum(f[0] * f[1] for f in fontes) / total
+        rotulo = fontes[0][3] if len(fontes) == 1 else "fusao"
+        return float(prob), float(np.mean([f[2] for f in fontes])), rotulo
+
+    # -------------------------------------------------------------------- saida
+    def analisar_regiao(self, imagem_rgb, bbox, armazenamento=None) -> ResultadoTomate:
+        armazenamento = armazenamento or self.armazenamento
+        recorte = _recortar(imagem_rgb, bbox)
+        prob, confianca, fonte = self.fundir(recorte)
+        dias = vida_util.dias_restantes(prob, armazenamento, self.limiar)
+        return ResultadoTomate(
+            classe=vida_util.classe_prevista(prob, self.limiar),
+            estado="fresco" if prob >= self.limiar else "deteriorado",
+            veredito=vida_util.veredito(prob, self.limiar),
+            apropriado=dias > 0,
+            confianca=confianca,
+            prob_fresco=prob,
+            dias_restantes=dias,
+            mensagem=vida_util.mensagem(prob, armazenamento, self.limiar),
+            recomendacao=vida_util.recomendacao(prob, armazenamento, self.limiar),
+            bbox=tuple(int(v) for v in bbox),
+            fonte=fonte,
+            incerto=vida_util.incerto(prob, self.limiar),
+            detalhes={"armazenamento": armazenamento, "limiar": self.limiar, "fonte": fonte},
+        )
+
+    def analisar(self, imagem_rgb, armazenamento=None, caixas=None) -> list:
+        if caixas is None:
+            caixas, fonte_deteccao = detectar_regioes(imagem_rgb, self.detector_yolo)
+        else:
+            fonte_deteccao = "externa"
+        resultados = [self.analisar_regiao(imagem_rgb, c, armazenamento) for c in caixas]
+        for resultado in resultados:
+            resultado.detalhes["deteccao"] = fonte_deteccao
+        resultados.sort(key=lambda r: r.confianca, reverse=True)
+        return resultados
+
+    def detectar(self, imagem_rgb) -> list:
+        """Alias retrocompativel de detect()."""
+        return self.detect(imagem_rgb)
+
+    def para_fruit_result(self, resultado: ResultadoTomate, image_path: str = ""):
+        from src.schemas.fruit import BoundingBox, FruitDetection, FruitResult
+
+        bbox = BoundingBox(*resultado.bbox) if resultado.bbox else None
+        deteccao_conf = float(resultado.detalhes.get("deteccao_conf", 1.0))
+
+        dados = {
+            # contrato real do schema do projeto
+            "fruit_type": FRUIT_TYPE,
+            "condition": _condicao(resultado.apropriado),
+            "confidence": resultado.confianca,
+            "detection_confidence": deteccao_conf,
+            "bbox": bbox,
+            "method": resultado.fonte,
+            # compatibilidade com a versao achatada
+            "especie": ESPECIE,
+            "classe": resultado.classe,
+            "estado": resultado.estado,
+            "confianca": resultado.confianca,
+            "apropriado": resultado.apropriado,
+            "dias_restantes": resultado.dias_restantes,
+            "detalhes": resultado.detalhes,
+        }
+
+        campos_deteccao = getattr(FruitDetection, "__dataclass_fields__", {})
+        if campos_deteccao:
+            filtrados = {chave: valor for chave, valor in dados.items() if chave in campos_deteccao}
+            deteccao = FruitDetection(**filtrados)
+            campos_resultado = getattr(FruitResult, "__dataclass_fields__", {})
+            dados_resultado = {"image_path": str(image_path), "detections": [deteccao]}
+            dados_resultado = {c: v for c, v in dados_resultado.items() if c in campos_resultado}
+            return FruitResult(**dados_resultado)
+
+        # Compatibilidade com a versao achatada do schema
+        dados = {
+            "especie": ESPECIE,
+            "classe": resultado.classe,
+            "estado": resultado.estado,
+            "confianca": resultado.confianca,
+            "apropriado": resultado.apropriado,
+            "dias_restantes": resultado.dias_restantes,
+            "bbox": bbox,
+            "detalhes": resultado.detalhes,
+        }
+        campos = getattr(FruitResult, "__dataclass_fields__", {})
+        if campos:
+            dados = {chave: valor for chave, valor in dados.items() if chave in campos}
+        return FruitResult(**dados)
+
+    # --------------------------------------------------------------------- lotes
+    def analisar_pasta(self, pasta, armazenamento=None, recursivo: bool = True) -> list:
+        pasta = Path(pasta)
+        padrao = "**/*" if recursivo else "*"
+        caminhos = sorted(p for p in pasta.glob(padrao) if p.suffix.lower() in EXTENSOES_IMAGEM)
+        resultados = []
+        for caminho in caminhos:
+            imagem = carregar_imagem(caminho)
+            if imagem is None:
+                continue
+            for resultado in self.analisar(imagem, armazenamento):
+                resultado.detalhes["arquivo"] = str(caminho)
+                resultados.append(resultado)
+        return resultados
+
+    @staticmethod
+    def resumo(resultados) -> dict:
+        total = len(resultados)
+        apropriados = sum(1 for r in resultados if r.apropriado)
+        dias = [r.dias_restantes for r in resultados if r.apropriado]
+        return {
+            "total": total,
+            "apropriados": apropriados,
+            "inapropriados": total - apropriados,
+            "pct_apropriado": round(100 * apropriados / total, 1) if total else 0.0,
+            "dias_medios_restantes": round(sum(dias) / len(dias), 1) if dias else 0.0,
+            "proximo_vencimento": min(dias) if dias else 0,
+            "incertos": sum(1 for r in resultados if r.incerto),
+        }
+
+
+================================================================================
+ARQUIVO: src/modules/tomato/vida_util.py
+================================================================================
+"""Veredito de consumo e estimativa de dias restantes para o tomate."""
+
+from src.modules.tomato.config import (
+    ARMAZENAMENTO_PADRAO, CLASSE_DETERIORADO, CLASSE_FRESCO,
+    LIMIAR_APROPRIADO, MARGEM_INCERTEZA, VIDA_UTIL_MAX_DIAS,
+)
+
+APROPRIADO = "apropriado"
+INAPROPRIADO = "inapropriado"
+
+
+def veredito(prob_fresco, limiar=LIMIAR_APROPRIADO):
+    return APROPRIADO if prob_fresco >= limiar else INAPROPRIADO
+
+
+def classe_prevista(prob_fresco, limiar=LIMIAR_APROPRIADO):
+    return CLASSE_FRESCO if prob_fresco >= limiar else CLASSE_DETERIORADO
+
+
+def dias_restantes(prob_fresco, armazenamento=ARMAZENAMENTO_PADRAO, limiar=LIMIAR_APROPRIADO):
+    """0 se inapropriado; 1..vida_max se apropriado (escala pela probabilidade)."""
+    if prob_fresco < limiar:
+        return 0
+    vida_max = VIDA_UTIL_MAX_DIAS.get(armazenamento, VIDA_UTIL_MAX_DIAS["geladeira"])
+    fracao = (min(prob_fresco, 1.0) - limiar) / (1.0 - limiar)
+    return int(max(1, round(1 + fracao * (vida_max - 1))))
+
+
+def mensagem(prob_fresco, armazenamento=ARMAZENAMENTO_PADRAO, limiar=LIMIAR_APROPRIADO):
+    dias = dias_restantes(prob_fresco, armazenamento, limiar)
+    if dias == 0:
+        return "Fora do consumo: faltam 0 dias - descartar ou compostar."
+    if dias <= 2:
+        return f"Apropriado, mas no limite: faltam {dias} dia(s) para sair do consumo."
+    return f"Apropriado para consumo: faltam {dias} dias para sair do consumo ({armazenamento})."
+
+
+def recomendacao(prob_fresco, armazenamento=ARMAZENAMENTO_PADRAO, limiar=LIMIAR_APROPRIADO):
+    dias = dias_restantes(prob_fresco, armazenamento, limiar)
+    if dias == 0:
+        return "Nao consumir. Retirar da geladeira e descartar."
+    if dias <= 2:
+        return "Usar hoje ou amanha; evitar novos armazenamentos longos."
+    if armazenamento == "bancada":
+        return "Manter fora da geladeira e consumir antes do prazo estimado."
+    return "Manter refrigerado entre 10 e 12 C para preservar sabor e textura."
+
+
+def incerto(prob_fresco, limiar=LIMIAR_APROPRIADO, margem=MARGEM_INCERTEZA):
+    return abs(prob_fresco - limiar) <= margem
+
+================================================================================
+ARQUIVO: src/modules/tomato/config.py
+================================================================================
+"""Configuracao do modulo tomate (deteccao + classificacao + veredito de consumo)."""
+
+ESPECIE = "tomate"
+
+# Ordem oficial das classes: indice 0 = fresco, indice 1 = deteriorado.
+CLASSES = ("tomate_fresco", "tomate_deteriorado")
+CLASSE_FRESCO, CLASSE_DETERIORADO = CLASSES
+
+ESTADOS = {"fresco": "apropriado", "deteriorado": "inapropriado"}
+
+LIMIAR_APROPRIADO = 0.50          # prob(fresco) >= limiar -> apropriado
+MARGEM_INCERTEZA = 0.08           # faixa em torno do limiar considerada incerta
+
+# Vida util maxima em dias (do estagio firme-maduro), por armazenamento.
+# 8-10 dias em temperatura otima; ate ~2 semanas refrigerado.
+VIDA_UTIL_MAX_DIAS = {"geladeira": 12, "bancada": 5}
+ARMAZENAMENTO_PADRAO = "geladeira"
+
+# Fusao das duas abordagens da disciplina
+PESO_PROFUNDO = 0.70              # ResNet-18
+PESO_CLASSICO = 0.30              # pipeline classico (HSV/regras)
+
+CONF_MIN_DETECCAO = 0.35
+AREA_MIN_REGIAO = 1200            # px^2
+MAX_REGIOES = 5
+
+# Aceita datasets tipo "fresh_tomatoes" e albuns do PlantVillage (Tomato___Late_blight...)
+PASTAS_DETERIORADO = (
+    "rotten", "deteriorado", "spoiled", "bad", "rot", "blight", "mold",
+    "mould", "spot", "mosaic", "bacterial", "curl", "yellow", "disease",
+)
+PASTAS_FRESCO = ("fresh", "fresco", "healthy", "saudavel")
+
+
+def classe_da_pasta(nome_pasta: str) -> str:
+    nome = str(nome_pasta).lower()
+    if any(chave in nome for chave in PASTAS_DETERIORADO):
+        return CLASSE_DETERIORADO
+    if any(chave in nome for chave in PASTAS_FRESCO):
+        return CLASSE_FRESCO
+    raise ValueError(f"Pasta desconhecida para tomate: {nome_pasta}")
+
+
+def decompor_classe(classe: str) -> tuple:
+    """('tomate_fresco') -> ('tomate', 'fresco')."""
+    if classe not in CLASSES:
+        raise ValueError(f"Classe invalida: {classe}")
+    especie, estado = classe.split("_", 1)
+    return especie, estado
+
+
+def veredito_da_classe(classe: str) -> str:
+    return ESTADOS[decompor_classe(classe)[1]]
+
+================================================================================
+ARQUIVO: src/schemas/fruit.py
+================================================================================
+"""Schemas unificados para todos os módulos de fruta."""
+from dataclasses import dataclass, field
+from enum import Enum
+
+class FruitCondition(Enum):
+    FRESH = "fresh"
+    ROTTEN = "rotten"
+    UNKNOWN = "unknown"
+
+@dataclass
+class BoundingBox:
+    x: int
+    y: int
+    width: int
+    height: int
+
+@dataclass
+class FruitDetection:
+    fruit_type: str
+    condition: FruitCondition
+    confidence: float
+    detection_confidence: float
+    bbox: BoundingBox
+    method: str
+    
+    @property
+    def is_appropriate(self) -> bool:
+        return self.condition == FruitCondition.FRESH
+
+@dataclass
+class FruitResult:
+    image_path: str
+    detections: list = field(default_factory=list)
+    
+    @property
+    def total_fruits(self) -> int:
+        return len(self.detections)
+    
+    @property
+    def appropriate_count(self) -> int:
+        return sum(1 for d in self.detections if d.is_appropriate)
+    
+    @property
+    def inappropriate_count(self) -> int:
+        return sum(1 for d in self.detections if d.condition == FruitCondition.ROTTEN)
+    
+    def to_dict(self) -> dict:
+        return {
+            "image": self.image_path,
+            "total": self.total_fruits,
+            "appropriate": self.appropriate_count,
+            "inappropriate": self.inappropriate_count,
+            "detections": [
+                {
+                    "fruit": d.fruit_type,
+                    "condition": d.condition.value,
+                    "confidence": round(d.confidence, 3),
+                    "bbox": [d.bbox.x, d.bbox.y, d.bbox.width, d.bbox.height],
+                    "method": d.method,
+                }
+                for d in self.detections
+            ],
+        }
+
+
+================================================================================
+ARQUIVO: src/modules/base.py
+================================================================================
+"""Contrato base para todos os módulos de fruta."""
+from abc import ABC, abstractmethod
+from src.schemas.fruit import FruitResult
+
+class BaseFruitModule(ABC):
+    fruit_type: str
+    
+    @abstractmethod
+    def detect(self, image_path: str) -> FruitResult:
+        ...
+    
+    @abstractmethod
+    def detect_batch(self, image_paths: list) -> list:
+        ...
+    
+    @abstractmethod
+    def load_model(self) -> None:
+        ...
+
+
+================================================================================
+ARQUIVO: src/pipeline.py
+================================================================================
+"""Orquestrador da aplicacao: registra modulos de fruta e executa a analise."""
+
+import time
+from dataclasses import dataclass, field
+
+import numpy as np
+
+MODULOS = {}
+DISPONIVEIS = {}
+
+
+def registrar(nome, fabrica, disponivel=True, descricao=""):
+    """Registra um modulo de fruta. fabrica(**kwargs) -> instancia analisavel."""
+    MODULOS[nome] = fabrica
+    DISPONIVEIS[nome] = {"disponivel": disponivel, "descricao": descricao}
+
+
+def listar():
+    return dict(DISPONIVEIS)
+
+
+def criar(nome, **kwargs):
+    if nome not in MODULOS:
+        raise KeyError(f"Modulo nao registrado: {nome}")
+    if not DISPONIVEIS[nome]["disponivel"]:
+        raise RuntimeError(f"Modulo ainda em implementacao: {nome}")
+    return MODULOS[nome](**kwargs)
+
+
+@dataclass
+class Analise:
+    modulo: str
+    resultados: list
+    resumo: dict
+    duracao_s: float
+    imagem_rgb: np.ndarray = None
+    parametros: dict = field(default_factory=dict)
+
+    def logs(self):
+        """Linhas de log legiveis, uma por fruta detectada."""
+        linhas = [
+            f"modulo={self.modulo} | frutas={self.resumo.get('total', 0)} "
+            f"| tempo={self.duracao_s:.2f}s",
+            f"apropriados={self.resumo.get('apropriados', 0)} "
+            f"inapropriados={self.resumo.get('inapropriados', 0)} "
+            f"incertos={self.resumo.get('incertos', 0)}",
+        ]
+        for indice, resultado in enumerate(self.resultados, start=1):
+            bbox = resultado.bbox or ()
+            linhas.append(
+                f"#{indice} {resultado.classe} estado={resultado.estado} "
+                f"p_fresco={resultado.prob_fresco:.3f} conf={resultado.confianca:.3f} "
+                f"dias={resultado.dias_restantes} fonte={resultado.fonte} bbox={bbox}"
+            )
+            linhas.append(f"    {resultado.veredito.upper()}: {resultado.mensagem}")
+            linhas.append(f"    acao: {resultado.recomendacao}")
+            if resultado.incerto:
+                linhas.append("    aviso: decisao proxima do limiar, revisar manualmente")
+        proximo = self.resumo.get("proximo_vencimento")
+        if proximo is not None:
+            linhas.append(f"proximo_vencimento={proximo} dia(s)")
+        return linhas
+
+    def para_dict(self):
+        return {
+            "modulo": self.modulo,
+            "duracao_s": round(self.duracao_s, 3),
+            "parametros": self.parametros,
+            "resumo": self.resumo,
+            "logs": self.logs(),
+            "resultados": [r.para_dict() for r in self.resultados],
+        }
+
+
+def analisar(nome_modulo, imagem_rgb, **kwargs):
+    """Executa o modulo escolhido e devolve uma Analise completa."""
+    if imagem_rgb is None:
+        raise ValueError("Imagem nao carregada.")
+    modulo = kwargs.pop("modulo", None) or criar(nome_modulo, **kwargs)
+    inicio = time.perf_counter()
+    resultados = modulo.analisar(imagem_rgb, kwargs.get("armazenamento"))
+    duracao = time.perf_counter() - inicio
+    resumo = modulo.resumo(resultados)
+    return Analise(
+        modulo=nome_modulo,
+        resultados=resultados,
+        resumo=resumo,
+        duracao_s=duracao,
+        imagem_rgb=imagem_rgb,
+        parametros={chave: valor for chave, valor in kwargs.items() if chave != "armazenamento"},
+    )
+
+
+def _fabrica_tomate(**kwargs):
+    from src.modules.tomato import TomatoModule
+
+    permitidos = {
+        "modelo_path", "armazenamento", "limiar", "usar_profundo",
+        "usar_classico", "especie_classico", "limiar_classico", "detector_yolo", "dispositivo",
+    }
+    return TomatoModule(**{c: v for c, v in kwargs.items() if c in permitidos})
+
+
+registrar("tomate", _fabrica_tomate, disponivel=True, descricao="Maca ainda sem classe; morango nao iniciado")
+
+================================================================================
+ARQUIVO: app.py
+================================================================================
+"""Smart Fridge Vision - aplicacao de analise de frutas.
+
+Rodar:  streamlit run app.py
+"""
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image
+
+from src import pipeline
+from src.utils import anotar, registro
+
+st.set_page_config(page_title="Smart Fridge Vision", page_icon="🍅", layout="wide")
+
+log = registro.configurar()
+
+st.title("🍅 Smart Fridge Vision")
+st.caption("Deteccao, classificacao e veredito de consumo por fruta")
+
+with st.sidebar:
+    st.header("Configuracao")
+    modulos = pipeline.listar()
+    nomes = list(modulos)
+    escolhido = st.selectbox("Modulo", nomes, index=nomes.index("tomate") if "tomate" in nomes else 0)
+
+    info = modulos.get(escolhido, {})
+    if not info.get("disponivel", True):
+        st.warning("Este modulo ainda esta em implementacao.")
+
+    armazenamento = st.radio("Armazenamento", ["geladeira", "bancada"], horizontal=True)
+    limiar = st.slider("Limiar de apropriado", 0.10, 0.90, 0.50, 0.05)
+
+    st.subheader("Abordagens")
+    usar_classico = st.checkbox("Classico (HSV + regras)", value=True)
+    usar_profundo = st.checkbox("Profundo (ResNet-18)", value=True)
+
+    modelo_path = st.text_input("Pesos da ResNet", value="models/tomate.pt")
+    if usar_profundo and not Path(modelo_path).exists():
+        st.info(f"'{modelo_path}' nao encontrado: a analise usara apenas o classico.")
+        usar_profundo = False
+
+    limiar_classico = st.slider("Limiar do classico", 0.00, 0.90, 0.50, 0.05)
+
+    st.divider()
+    arquivo = st.file_uploader("Imagem", type=["jpg", "jpeg", "png", "bmp", "webp"])
+
+if arquivo is None:
+    st.info("Envie uma imagem para ver o resultado anotado e os logs.")
+    st.stop()
+
+imagem_rgb = np.asarray(Image.open(arquivo).convert("RGB"))
+st.caption(f"arquivo: {arquivo.name} | {imagem_rgb.shape[1]}x{imagem_rgb.shape[0]} px")
+
+try:
+    analise = pipeline.analisar(
+        escolhido, imagem_rgb,
+        armazenamento=armazenamento, limiar=limiar,
+        usar_classico=usar_classico, usar_profundo=usar_profundo,
+        modelo_path=modelo_path if usar_profundo else None,
+        limiar_classico=limiar_classico,
+    )
+except Exception as erro:
+    st.error(f"Falha na analise: {type(erro).__name__}: {erro}")
+    st.stop()
+
+registro.gravar(log, analise)
+
+coluna_imagem, coluna_metricas = st.columns([2, 1])
+
+with coluna_imagem:
+    titulo = f"{analise.modulo} | {armazenamento} | {analise.resumo['total']} fruta(s)"
+    st.image(anotar.desenhar(imagem_rgb, analise.resultados, titulo), use_container_width=True)
+    destino = Path("output") / f"anotado_{Path(arquivo.name).stem}.png"
+    anotar.salvar(imagem_rgb, analise.resultados, destino, titulo)
+    st.caption(f"Imagem anotada salva em {destino}")
+
+with coluna_metricas:
+    resumo = analise.resumo
+    st.metric("Frutas detectadas", resumo["total"])
+    st.metric("Apropriadas", resumo["apropriados"])
+    st.metric("Inapropriadas", resumo["inapropriados"])
+    st.metric("Dias medios restantes", f"{resumo['dias_medios_restantes']}")
+    st.metric("Proximo vencimento", f"{resumo['proximo_vencimento']} d")
+    if resumo["incertos"]:
+        st.warning(f"{resumo['incertos']} decisao(oes) proxima(s) do limiar.")
+    st.caption(f"tempo de analise: {analise.duracao_s:.2f}s")
+
+aba_resultados, aba_logs, aba_json = st.tabs(["Resultados", "Logs", "Exportar"])
+
+with aba_resultados:
+    tabela = pd.DataFrame([
+        {
+            "#": indice, "classe": r.classe, "veredito": r.veredito,
+            "dias": r.dias_restantes, "p_fresco": round(r.prob_fresco, 3),
+            "confianca": round(r.confianca, 3), "fonte": r.fonte,
+            "recomendacao": r.recomendacao,
+        }
+        for indice, r in enumerate(analise.resultados, start=1)
+    ])
+    st.dataframe(tabela, use_container_width=True, hide_index=True)
+
+with aba_logs:
+    st.code("\n".join(analise.logs()), language="log")
+
+with aba_json:
+    import json
+
+    st.download_button(
+        "Baixar JSON da analise",
+        data=json.dumps(analise.para_dict(), ensure_ascii=False, indent=2),
+        file_name=f"analise_{Path(arquivo.name).stem}.json",
+        mime="application/json",
+    )
+    st.json(analise.para_dict())
+
+================================================================================
+ARQUIVO: tests/test_tomato.py
+================================================================================
+"""Testes do modulo tomate (pytest)."""
+
+import numpy as np
+import pytest
+
+from src.modules.tomato import CLASSES, TomatoModule, classe_da_pasta, decompor_classe
+from src.modules.tomato.vida_util import dias_restantes, mensagem, veredito
+
+
+def test_classes():
+    assert CLASSES == ("tomate_fresco", "tomate_deteriorado")
+
+
+@pytest.mark.parametrize("pasta", ["Tomato___fresh", "fresh_tomatoes", "tomate_fresco"])
+def test_pasta_fresca(pasta):
+    assert classe_da_pasta(pasta) == "tomate_fresco"
+
+
+@pytest.mark.parametrize("pasta", ["Tomato___Late_blight", "rotten_tomatoes"])
+def test_pasta_deteriorada(pasta):
+    assert classe_da_pasta(pasta) == "tomate_deteriorado"
+
+
+def test_decompor_classe():
+    assert decompor_classe("tomate_fresco") == ("tomate", "fresco")
+
+
+@pytest.mark.parametrize("prob", [1.0, 0.9, 0.7, 0.51])
+def test_apropriado_tem_dias(prob):
+    assert veredito(prob) == "apropriado"
+    assert dias_restantes(prob) >= 1
+
+
+@pytest.mark.parametrize("prob", [0.49, 0.3, 0.0])
+def test_inapropriado_zera_dias(prob):
+    assert veredito(prob) == "inapropriado"
+    assert dias_restantes(prob) == 0
+    assert "descartar" in mensagem(prob)
+
+
+def test_geladeira_dura_mais_que_bancada():
+    assert dias_restantes(0.9, "geladeira") > dias_restantes(0.9, "bancada")
+
+
+def test_contrato_do_modulo_base():
+    modulo = TomatoModule(usar_profundo=False, usar_classico=True)
+    assert not TomatoModule.__abstractmethods__
+    assert modulo.fruit_type == "tomate"
+    assert all(hasattr(modulo, nome) for nome in ("detect", "detect_batch", "load_model"))
+
+
+def test_analise_classica():
+    imagem = np.zeros((120, 160, 3), dtype=np.uint8)
+    imagem[20:100, 30:130] = (200, 40, 30)
+    modulo = TomatoModule(usar_profundo=False, usar_classico=True, limiar_classico=0.05)
+    resultados = modulo.analisar(imagem)
+    assert resultados
+    assert resultados[0].fonte in ("classico", "fusao")
+    assert modulo.resumo(resultados)["total"] == len(resultados)
+
+def test_sem_abordagens_falha():
+    imagem = np.zeros((60, 60, 3), dtype=np.uint8)
+    with pytest.raises(RuntimeError):
+        TomatoModule(usar_profundo=False, usar_classico=False).analisar(imagem)
+
+
+def test_detect_retorna_fruit_result():
+    from src.schemas.fruit import FruitResult
+
+    imagem = np.zeros((120, 160, 3), dtype=np.uint8)
+    imagem[20:100, 30:130] = (200, 40, 30)
+
+    modulo = TomatoModule(usar_profundo=False, usar_classico=True, limiar_classico=0.50)
+    resultados = modulo.detect(imagem)
+
+    assert len(resultados) == 1
+    assert isinstance(resultados[0], FruitResult)
+    deteccao = resultados[0].detections[0]
+    assert deteccao.fruit_type in ("tomato", "tomate")
+    assert deteccao.bbox is not None
+    assert 0.0 <= deteccao.confidence <= 1.0
+    assert deteccao.method in ("classico", "fusao", "profundo")
+

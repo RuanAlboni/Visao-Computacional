@@ -1,0 +1,8 @@
+numpy
+Pillow
+torch
+torchvision
+ultralytics
+streamlit
+scikit-learn
+pytest
