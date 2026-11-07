@@ -1,18 +1,31 @@
-# Ambientes virtuais
+# Ambiente Python e caches
 .venv/
 venv/
 env/
-
-# Cache do Python
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Configurações locais
+# Credenciais e arquivos locais
 .env
+.env.*
+!.env.example
 .streamlit/secrets.toml
 .vscode/
 .idea/
+*.Zone.Identifier
+.DS_Store
+Thumbs.db
 
-# Credenciais
-kaggle.json
+# Dados grandes, logs e execucoes temporarias
+data/
+logs/
+runs/
+output/
+outputs/
+*.log
+
+# IMPORTANTE: manter modelos/*.pth, modelos/*.pt e resultados
+# disponiveis para versionamento. Checkpoints são gerenciados pelo Git LFS.
