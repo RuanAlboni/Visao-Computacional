@@ -1,0 +1,123 @@
+{
+  "amostras_teste": 2698,
+  "classico": {
+    "cobertura": 1.0,
+    "geral": {
+      "n": 2698,
+      "acuracia": 0.8080059303187547,
+      "precisao_deteriorada": 0.812807881773399,
+      "revocacao_deteriorada": 0.8604954367666232,
+      "f1_deteriorada": 0.8359721342621913,
+      "f1_macro": 0.8022577382660376
+    },
+    "por_especie": {
+      "maca": {
+        "n": 996,
+        "acuracia": 0.8303212851405622,
+        "precisao_deteriorada": 0.8648648648648649,
+        "revocacao_deteriorada": 0.8519134775374376,
+        "f1_deteriorada": 0.8583403185247276,
+        "f1_macro": 0.8234129627667442
+      },
+      "banana": {
+        "n": 911,
+        "acuracia": 0.9527991218441273,
+        "precisao_deteriorada": 0.9387387387387387,
+        "revocacao_deteriorada": 0.9830188679245283,
+        "f1_deteriorada": 0.96036866359447,
+        "f1_macro": 0.9510120115801387
+      },
+      "laranja": {
+        "n": 791,
+        "acuracia": 0.6131479140328698,
+        "precisao_deteriorada": 0.6016771488469602,
+        "revocacao_deteriorada": 0.7121588089330024,
+        "f1_deteriorada": 0.6522727272727272,
+        "f1_macro": 0.6081876456876456
+      }
+    },
+    "nota": "Métricas excluem falhas de segmentação; ver cobertura e CSV de erros."
+  },
+  "resnet18": {
+    "condicao_geral": {
+      "n": 2698,
+      "acuracia": 0.9996293550778355,
+      "precisao_deteriorada": 0.9993485342019544,
+      "revocacao_deteriorada": 1.0,
+      "f1_deteriorada": 0.9996741609644836,
+      "f1_macro": 0.999622211552289
+    },
+    "condicao_por_especie": {
+      "maca": {
+        "n": 996,
+        "acuracia": 0.998995983935743,
+        "precisao_deteriorada": 0.9983388704318937,
+        "revocacao_deteriorada": 1.0,
+        "f1_deteriorada": 0.999168744804655,
+        "f1_macro": 0.9989506588408572
+      },
+      "banana": {
+        "n": 911,
+        "acuracia": 1.0,
+        "precisao_deteriorada": 1.0,
+        "revocacao_deteriorada": 1.0,
+        "f1_deteriorada": 1.0,
+        "f1_macro": 1.0
+      },
+      "laranja": {
+        "n": 791,
+        "acuracia": 1.0,
+        "precisao_deteriorada": 1.0,
+        "revocacao_deteriorada": 1.0,
+        "f1_deteriorada": 1.0,
+        "f1_macro": 1.0
+      }
+    },
+    "acuracia_seis_classes": 0.9992587101556709,
+    "f1_macro_seis_classes": 0.9992374476475328,
+    "acuracia_especie": 0.9992587101556709,
+    "arquitetura": "resnet18",
+    "epoca_checkpoint": 4
+  },
+  "cnn": {
+    "condicao_geral": {
+      "n": 2698,
+      "acuracia": 0.9785025945144552,
+      "precisao_deteriorada": 0.9823529411764705,
+      "revocacao_deteriorada": 0.9797913950456323,
+      "f1_deteriorada": 0.9810704960835509,
+      "f1_macro": 0.9780995705117583
+    },
+    "condicao_por_especie": {
+      "maca": {
+        "n": 996,
+        "acuracia": 0.9698795180722891,
+        "precisao_deteriorada": 0.9798319327731092,
+        "revocacao_deteriorada": 0.9700499168053245,
+        "f1_deteriorada": 0.9749163879598662,
+        "f1_macro": 0.9686139728744054
+      },
+      "banana": {
+        "n": 911,
+        "acuracia": 0.9923161361141603,
+        "precisao_deteriorada": 0.9906191369606003,
+        "revocacao_deteriorada": 0.9962264150943396,
+        "f1_deteriorada": 0.993414863593603,
+        "f1_macro": 0.9920961010985143
+      },
+      "laranja": {
+        "n": 791,
+        "acuracia": 0.9734513274336283,
+        "precisao_deteriorada": 0.9751243781094527,
+        "revocacao_deteriorada": 0.9727047146401985,
+        "f1_deteriorada": 0.9739130434782609,
+        "f1_macro": 0.9734430082256169
+      }
+    },
+    "acuracia_seis_classes": 0.963306152705708,
+    "f1_macro_seis_classes": 0.9641930637715256,
+    "acuracia_especie": 0.9822090437361009,
+    "arquitetura": "cnn",
+    "epoca_checkpoint": 12
+  }
+}
