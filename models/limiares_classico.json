@@ -1,0 +1,15 @@
+{
+  "limiares": {
+    "maca": 0.020031671162680433,
+    "banana": 0.10302611482849806,
+    "laranja": 0.015141699786647212
+  },
+  "f1_validacao": {
+    "maca": 0.8019524554735822,
+    "banana": 0.959646465694309,
+    "laranja": 0.620780322553466
+  },
+  "amostras": 2166,
+  "falhas_segmentacao": 0,
+  "metodo": "Limiares maximizando F1-macro apenas na validação."
+}
